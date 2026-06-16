@@ -6,6 +6,7 @@ from typing import Any
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Path, Request, status
 from fastapi.security import APIKeyHeader
+from opentelemetry import trace
 from pydantic import BaseModel, Field
 
 from metrics import setup_metrics
@@ -27,6 +28,7 @@ setup_tracing(app)
 # Expose Prometheus metrics at /metrics (pull model; always on, mirroring the
 # api-server's /actuator/prometheus). The metrics half of the observability split.
 setup_metrics(app)
+tracer = trace.get_tracer(__name__)
 
 # --- API Key Authentication ---
 AI_MODULE_API_KEY = os.environ.get("AI_MODULE_API_KEY", "")
@@ -110,25 +112,29 @@ async def predict(request: PredictRequest, _=Depends(verify_api_key)) -> Predict
 @app.post("/predict/bulk", response_model=list[PredictResponse])
 async def predict_bulk(request: BulkPredictRequest, _=Depends(verify_api_key)) -> list[PredictResponse]:
     """Generate demand forecasts for multiple products in one request."""
-    results: list[PredictResponse] = []
-    errors: list[str] = []
+    with tracer.start_as_current_span("ai.predict_bulk") as span:
+        span.set_attribute("bulk.product_count", len(request.products))
+        results: list[PredictResponse] = []
+        errors: list[str] = []
 
-    for item in request.products:
-        try:
-            result = await forecast_async(item.product_id, item.days)
-            results.append(PredictResponse(**result))
-        except ValueError as exc:
-            errors.append(f"product_id={item.product_id}: {exc}")
-        except RuntimeError as exc:
-            errors.append(f"product_id={item.product_id}: {exc}")
+        for item in request.products:
+            try:
+                result = await forecast_async(item.product_id, item.days)
+                results.append(PredictResponse(**result))
+            except ValueError as exc:
+                errors.append(f"product_id={item.product_id}: {exc}")
+            except RuntimeError as exc:
+                errors.append(f"product_id={item.product_id}: {exc}")
 
-    if errors:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"errors": errors, "successful": len(results)},
-        )
+        span.set_attribute("bulk.success_count", len(results))
+        span.set_attribute("bulk.error_count", len(errors))
+        if errors:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"errors": errors, "successful": len(results)},
+            )
 
-    return results
+        return results
 
 
 @app.get("/evaluate/{product_id}", response_model=EvaluateResponse)
